@@ -7,6 +7,8 @@
 #include "driverlib/pwm.h"
 #include "driverlib/sysctl.h"
 #include "driverlib/ssi.h"
+#include "PIDheater.h"
+#include "PIDcooler.h"
 #include "DelayMs.h"
 #include "pwm1.h"
 #include "pwm2.h"
@@ -15,50 +17,45 @@
 #include "LCD_I2C.h"
 #include "floattostring.h"
 
+// PID parametreleri
+#define PID_KP1 200.0f
+#define PID_KI1 150.0f       //Ä±sÄ±tma
+#define PID_KD1 0.5f
+#define SETPOINT1 35.0f
 
-// Isýtýcý ve soðutucu pin tanýmlarý
-#define HEATER_IN1 GPIO_PIN_2
-#define HEATER_IN2 GPIO_PIN_3
-#define HEATER2_IN3 GPIO_PIN_0
-#define HEATER2_IN4 GPIO_PIN_1
+#define PID_KP2 7.0f
+#define PID_KI2 0.3f
+#define PID_KD2 25.0f
+#define SETPOINT2 8.0f
+#define HYSTERESIS 0.5f
+
+// L298N PWM ve yÃ¶n pinleri
+#define HEATER_PWM_PIN GPIO_PIN_3 // PB5 (M0PWM3)
+#define HEATER_IN1 GPIO_PIN_2     // PB2
+#define HEATER_IN2 GPIO_PIN_3     // PB3
+#define HEATER2_PWM_PIN GPIO_PIN_2 // PB6 (M0PWM0)
+#define HEATER2_IN3 GPIO_PIN_0     // PB0
+#define HEATER2_IN4 GPIO_PIN_1     // PB1
 #define GPIO_PORTB GPIO_PORTB_BASE
 
-#define RPWM_PIN     GPIO_PIN_4
-#define LPWM_PIN     GPIO_PIN_5
-#define R_EN_PIN     GPIO_PIN_6
-#define L_EN_PIN     GPIO_PIN_7
+// BTS7960 PWM ve yÃ¶n pinleri
+#define RPWM_PIN     GPIO_PIN_4   // PE4 > PWM Ã§Ä±kÄ±ÅŸÄ±
+#define LPWM_PIN     GPIO_PIN_5   // PE5 > LOW
+#define R_EN_PIN     GPIO_PIN_6   // PC6 > HIGH
+#define L_EN_PIN     GPIO_PIN_7   // PC7 > HIGH
 
 #define MODE_SWITCH_PORT GPIO_PORTA_BASE
 #define MODE_SWITCH_PIN  GPIO_PIN_5
-
-// BULANIK MANTIK KONTROL FONKSÝYONLARI
-
-float Fuzzy_Heater_Output(float error) {
-    if (error > 2.5f)
-        return 100.0f;
-    else if (error > 2.0f)
-           return 90.0f;
-    else if (error > 1.0f)
-        return 80.0f;
-    else
-        return 70.0f;
-
-}
-
-float Fuzzy_Cooler_Output(float error) {
-    if (error > 0.5f)
-        return 100.0f;
-    else if (error > -1.5f)
-        return 75.0f;
-    else
-        return 0.0f;
-}
 
 
 void Heater_GPIO_Init(void) {
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
     while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB));
-    GPIOPinTypeGPIOOutput(GPIO_PORTB, HEATER_IN1 | HEATER_IN2 | HEATER2_IN3 | HEATER2_IN4);
+
+    GPIOPinTypeGPIOOutput(GPIO_PORTB,
+    HEATER_IN1 | HEATER_IN2 | HEATER2_IN3 | HEATER2_IN4);
+
+    // Tek yÃ¶nlÃ¼ Ã§alÄ±ÅŸma: IN1=1, IN2=0 | IN3=1, IN4=0
     GPIOPinWrite(GPIO_PORTB, HEATER_IN1, HEATER_IN1);
     GPIOPinWrite(GPIO_PORTB, HEATER_IN2, 0);
     GPIOPinWrite(GPIO_PORTB, HEATER2_IN3, HEATER2_IN3);
@@ -80,14 +77,14 @@ void Mode_Switch_Init(void) {
     GPIOPinTypeGPIOInput(MODE_SWITCH_PORT, MODE_SWITCH_PIN);
     GPIOPadConfigSet(MODE_SWITCH_PORT, MODE_SWITCH_PIN, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
 }
-
-
 bool Is_Heating_Mode(void) {
-    return (GPIOPinRead(MODE_SWITCH_PORT, MODE_SWITCH_PIN) == 0);
-}
-
-  int main(void) {
+       // Switch OFF (GND'ye baÄŸlÄ±) ise Ä±sÄ±tma modu
+       return (GPIOPinRead(MODE_SWITCH_PORT, MODE_SWITCH_PIN) == 0);
+   }
+int main(void) {
     SysCtlClockSet(SYSCTL_SYSDIV_1 | SYSCTL_USE_OSC | SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_1|GPIO_PIN_2);
 
     MAX6675_Init1();
     MAX6675_Init2();
@@ -98,213 +95,92 @@ bool Is_Heating_Mode(void) {
     LCD_Init();
     Mode_Switch_Init();
 
+      PIDController1 pid1;
+      PID_Init1(&pid1, PID_KP1, PID_KI1, PID_KD1, SETPOINT1);
+      PIDController2 pid2;
+      PID_Init2(&pid2, PID_KP2, PID_KI2, PID_KD2, SETPOINT2);
+
     float temperature1;
     float temperature2;
-    char bufferheat[16];
-    char buffercold[16];
-    char buffer1[16];
-    char buffer2[16];
-
-    float SETPOINT1;
-    float SETPOINT2;
-
-    float error1;
-    float error2;
-
-    int i = 0;
+    char buffer[16];
 
     while(1) {
+
+       uint32_t currentTime = SysCtlClockGet() / 16000;
         LCD_Clear();
-
         if (Is_Heating_Mode()) {
-            if (i==0){
-                Turn_Off_Cooling();
-            }
-            i++;
 
-            temperature1 = MAX6675_ReadTemp1();
-            DelayMs(10);
-            temperature2 = MAX6675_ReadTemp2();
-            DelayMs(10);
+            Turn_Off_Cooling();
+            GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, 0);
+              temperature1 = MAX6675_ReadTemp1();
+              DelayMs(10);
+              ftoa(temperature1, buffer, 2);
 
-            if (temperature1>=41.5f){
+              LCD_WriteAt(1, 0,"Isitma Aktif. ");
+              LCD_WriteAt(0, 0,"Derece:");
+              LCD_WriteAt(0, 8,buffer);
+              LCD_WriteAt(0, 14,"C");
 
-            }
+               if(temperature1 >= SETPOINT1) {
+                                     GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_1, 2);
+                                     SetPWM_Duty1(0); // SÄ±caklÄ±k setpointâ€™i geÃ§ti, kapat
 
-            else {
-               temperature2 = temperature2+2.0f;
-            }
+                                     pid1.outputSum = 0;
 
+                                     GPIOPinWrite(GPIO_PORTB, HEATER_IN1 | HEATER_IN2, 0);
 
+                                     GPIOPinWrite(GPIO_PORTB, HEATER2_IN3 | HEATER2_IN4, 0);
 
-            SETPOINT1 = 44.0f;  // Hedef deðeri  isitma
-            SETPOINT2 = 22.0f;   // Hedef deðeri soðutma
+                                 }
 
-            ftoa(temperature1, bufferheat, 2);
-            ftoa(temperature2, buffercold, 2);
-            ftoa(SETPOINT1, buffer1, 2);
-            ftoa(SETPOINT2, buffer2, 2);
+                   else {
 
-                LCD_WriteAt(1, 0,buffer1);
-                LCD_WriteAt(1, 5,"C");
-                LCD_WriteAt(1, 6,"  -  ");
-                LCD_WriteAt(1, 11,buffer2);
-                LCD_WriteAt(1, 15,"C");
-                LCD_WriteAt(0, 0,bufferheat);
-                LCD_WriteAt(0, 5,"C");
-                LCD_WriteAt(0, 6," --");
-                LCD_WriteAt(0, 10,buffercold);
-                LCD_WriteAt(0, 15,"C");
+                       GPIOPinWrite(GPIO_PORTB, HEATER_IN1, HEATER_IN1);
 
+                       GPIOPinWrite(GPIO_PORTB, HEATER_IN2, 0);
 
-            error1 = SETPOINT1 - temperature1;
+                       GPIOPinWrite(GPIO_PORTB, HEATER2_IN3, HEATER2_IN3);
 
-            if(temperature2<SETPOINT2){
-                //Sogutma kapa
-                SetPWM_Duty2(0);
-                GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, 0);
+                       GPIOPinWrite(GPIO_PORTB, HEATER2_IN4, 0);
 
-                if(temperature1 >= SETPOINT1) {
-                           //Isýtma kapa
-                            SetPWM_Duty1(0);
-                            GPIOPinWrite(GPIO_PORTB, HEATER_IN1 | HEATER_IN2, 0);
-                            GPIOPinWrite(GPIO_PORTB, HEATER2_IN3 | HEATER2_IN4, 0);
-                        }
-                else {
-                            //Isýtma Ac
-                           GPIOPinWrite(GPIO_PORTB, HEATER_IN1, HEATER_IN1);
-                            GPIOPinWrite(GPIO_PORTB, HEATER_IN2, 0);
-                            GPIOPinWrite(GPIO_PORTB, HEATER2_IN3, HEATER2_IN3);
-                            GPIOPinWrite(GPIO_PORTB, HEATER2_IN4, 0);
-                            float output1 = Fuzzy_Heater_Output(error1);
-                            SetPWM_Duty1(output1);
-                        }
+                       GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_1, 0);
 
+                       float output1 = PID_Compute1(&pid1, temperature1, currentTime);
 
-            }
-            else{
-                if(temperature1 >= SETPOINT1) {
-                                         //Isýtma kapa
-                                         SetPWM_Duty1(0);
-                                         GPIOPinWrite(GPIO_PORTB, HEATER_IN1 | HEATER_IN2, 0);
-                                         GPIOPinWrite(GPIO_PORTB, HEATER2_IN3 | HEATER2_IN4, 0);
+                       SetPWM_Duty1(output1);
 
-                                         //Sogutucuyu ac
+                   }
 
-                                          GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, R_EN_PIN | L_EN_PIN);
-                                          SetPWM_Duty2(90.0f);
-                                                                       }
-
-                else {
-                             //Sogutucuyu ac
-                                   GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, R_EN_PIN | L_EN_PIN);
-                                   SetPWM_Duty2(90.0f);
-                                     //Isýtma ac
-                                        GPIOPinWrite(GPIO_PORTB, HEATER_IN1, HEATER_IN1);
-                                         GPIOPinWrite(GPIO_PORTB, HEATER_IN2, 0);
-                                         GPIOPinWrite(GPIO_PORTB, HEATER2_IN3, HEATER2_IN3);
-                                         GPIOPinWrite(GPIO_PORTB, HEATER2_IN4, 0);
-                                         float output1 = Fuzzy_Heater_Output(error1);
-                                         SetPWM_Duty1(output1);
-                                     }
-
-            }
-
-
-
-        }
-
+               }
         else {
 
-            if (i==0){
-                           Turn_Off_Heating();
-                       }
-                       i++;
+        Turn_Off_Heating();
+          GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_1, 0);
 
-                       temperature1 = MAX6675_ReadTemp1();
-                       DelayMs(10);
-                       temperature2 = MAX6675_ReadTemp2();
-                       DelayMs(10);
+        temperature2 = MAX6675_ReadTemp2();
+        DelayMs(10);
+        ftoa(temperature2, buffer, 2); 
+        LCD_WriteAt(1, 0,"Sogutma Aktif. ");
+        LCD_WriteAt(0, 0,"Derece:");
+        LCD_WriteAt(0, 8,buffer);
+        LCD_WriteAt(0, 14,"C");
 
-                       if (temperature2>4.0f & temperature1<23.0f){
-
-                       }
-
-                       else {
-                          temperature2 = temperature2-3.75f;
-                       }
-
-                       SETPOINT1 = 22.0f;  // Hedef deðeri  isitma
-                       SETPOINT2 = 0.0f;   // Hedef deðeri soðutma
-
-                       ftoa(temperature1, bufferheat, 2);
-                       ftoa(temperature2, buffercold, 2);
-                       ftoa(SETPOINT1, buffer1, 2);
-                       ftoa(SETPOINT2, buffer2, 2);
-
-                           LCD_WriteAt(1, 0,buffer1);
-                           LCD_WriteAt(1, 5,"C");
-                           LCD_WriteAt(1, 6,"  -  ");
-                           LCD_WriteAt(1, 11,buffer2);
-                           LCD_WriteAt(1, 15,"C");
-                           LCD_WriteAt(0, 0,bufferheat);
-                           LCD_WriteAt(0, 5,"C");
-                           LCD_WriteAt(0, 6," --");
-                           LCD_WriteAt(0, 10,buffercold);
-                           LCD_WriteAt(0, 15,"C");
-
-
-                         error2 = temperature2 - SETPOINT2;
-
-                       if(temperature1<SETPOINT1){
-                           //Isýtma ac
-                           GPIOPinWrite(GPIO_PORTB, HEATER_IN1, HEATER_IN1);
-                           GPIOPinWrite(GPIO_PORTB, HEATER_IN2, 0);
-                           GPIOPinWrite(GPIO_PORTB, HEATER2_IN3, HEATER2_IN3);
-                           GPIOPinWrite(GPIO_PORTB, HEATER2_IN4, 0);
-                           SetPWM_Duty1(70.0f);
-
-                           if(temperature2 >= SETPOINT2) {
-                                      //Sogutma ac
-                               GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, R_EN_PIN | L_EN_PIN);
-                               float output2 = Fuzzy_Cooler_Output(error2);
-                               SetPWM_Duty2(output2);
-                                   }
-                           else {
-                                       //Sogutma kapa
-                               SetPWM_Duty2(0);
-                               GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, 0);
-                                   }
-
-
-                       }
-                       else{
-
-                           if(temperature2 >= SETPOINT2) {
-                               //Sogutma ac
-                                                              GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, R_EN_PIN | L_EN_PIN);
-                                                              float output2 = Fuzzy_Cooler_Output(error2);
-                                                              SetPWM_Duty2(output2);
-
-                                                              //Isýtma kapa
-                                                            SetPWM_Duty1(0);
-                                                            GPIOPinWrite(GPIO_PORTB, HEATER_IN1 | HEATER_IN2, 0);
-                                                            GPIOPinWrite(GPIO_PORTB, HEATER2_IN3 | HEATER2_IN4, 0);
-
-                           }
-
-                           else {
-                               //Sogutma kapa
-                                                           SetPWM_Duty2(0);
-                                                           GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, 0);
-                                                           //Isýtma kapa
-                                                           SetPWM_Duty1(0);
-                                                           GPIOPinWrite(GPIO_PORTB, HEATER_IN1 | HEATER_IN2, 0);
-                                                           GPIOPinWrite(GPIO_PORTB, HEATER2_IN3 | HEATER2_IN4, 0);
-                           }
-
-                       }
+            // SoÄŸutma iÃ§in histerezisli kontrol
+            if (temperature2 > (SETPOINT2+HYSTERESIS)) {
+                // SoÄŸutmaya baÅŸla
+                GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, R_EN_PIN | L_EN_PIN);
+                GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, 0);
+                float output2 = PID_Compute2(&pid2, temperature2, currentTime);
+                SetPWM_Duty2(output2);  
+            }
+            else if (temperature2 <= (SETPOINT2-HYSTERESIS)) {
+                // SoÄŸutmayÄ± durdur
+                SetPWM_Duty2(0);
+                GPIOPinWrite(GPIO_PORTC_BASE, R_EN_PIN | L_EN_PIN, 0);
+                GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, 4);
+                pid2.outputSum = 0;
+            }
         }
-        DelayMs(275);
-    }
+        DelayMs(400);
 }
+}           
